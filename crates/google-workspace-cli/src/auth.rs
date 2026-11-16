@@ -204,6 +204,9 @@ impl AccessTokenProvider for FakeTokenProvider {
 ///
 /// Tries credentials in order:
 /// 0. `GOOGLE_WORKSPACE_CLI_TOKEN` env var (raw access token, highest priority)
+/// 0b. `GOOGLE_WORKSPACE_CLI_REFRESH_TOKEN` with `GOOGLE_WORKSPACE_CLI_CLIENT_ID` and
+///     `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET` env vars (authorized user, nothing read from or
+///     written to disk)
 /// 1. `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` env var (plaintext JSON, can be User or Service Account)
 /// 2. Encrypted credentials at `~/.config/gws/credentials.enc`
 /// 3. Plaintext credentials at `~/.config/gws/credentials.json` (User only)
@@ -219,6 +222,16 @@ pub async fn get_token(scopes: &[&str]) -> anyhow::Result<String> {
         }
     }
 
+    // 0b. Refresh token from env vars. Access tokens are cached in memory only: a shared
+    // on-disk cache could hand back a token minted for a different account (see #572).
+    if let Some(creds) = credential_from_env_vars(
+        std::env::var("GOOGLE_WORKSPACE_CLI_REFRESH_TOKEN").ok(),
+        std::env::var("GOOGLE_WORKSPACE_CLI_CLIENT_ID").ok(),
+        std::env::var("GOOGLE_WORKSPACE_CLI_CLIENT_SECRET").ok(),
+    )? {
+        return get_token_inner(scopes, creds, None).await;
+    }
+
     let creds_file = std::env::var("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE").ok();
     let config_dir = crate::auth_commands::config_dir();
     let enc_path = credential_store::encrypted_credentials_path();
@@ -226,7 +239,41 @@ pub async fn get_token(scopes: &[&str]) -> anyhow::Result<String> {
     let token_cache = config_dir.join("token_cache.json");
 
     let creds = load_credentials_inner(creds_file.as_deref(), &enc_path, &default_path).await?;
-    get_token_inner(scopes, creds, &token_cache).await
+    get_token_inner(scopes, creds, Some(&token_cache)).await
+}
+
+/// Builds an authorized-user credential from environment variables, so a refresh token
+/// can be supplied without a plaintext credentials file on disk (CI, containers and
+/// sandboxed agents that inject secrets as environment variables).
+///
+/// Returns `Ok(None)` when no refresh token is set, and an error when one is set without
+/// both the client ID and the client secret.
+fn credential_from_env_vars(
+    refresh_token: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+) -> anyhow::Result<Option<Credential>> {
+    let Some(refresh_token) = refresh_token.filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let (Some(client_id), Some(client_secret)) = (
+        client_id.filter(|v| !v.is_empty()),
+        client_secret.filter(|v| !v.is_empty()),
+    ) else {
+        anyhow::bail!(
+            "GOOGLE_WORKSPACE_CLI_REFRESH_TOKEN is set, but GOOGLE_WORKSPACE_CLI_CLIENT_ID and \
+             GOOGLE_WORKSPACE_CLI_CLIENT_SECRET must be set as well"
+        );
+    };
+    let secret: yup_oauth2::authorized_user::AuthorizedUserSecret =
+        serde_json::from_value(serde_json::json!({
+            "type": "authorized_user",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+        }))
+        .context("Failed to build authorized user credentials from environment variables")?;
+    Ok(Some(Credential::AuthorizedUser(secret)))
 }
 
 /// Check if HTTP proxy environment variables are set
@@ -240,10 +287,11 @@ pub(crate) fn response_text_or_placeholder<E>(result: Result<String, E>) -> Stri
     result.unwrap_or_else(|_| "(could not read error response body)".to_string())
 }
 
+/// `token_cache_path` of `None` keeps access tokens in memory only.
 async fn get_token_inner(
     scopes: &[&str],
     creds: Credential,
-    token_cache_path: &std::path::Path,
+    token_cache_path: Option<&std::path::Path>,
 ) -> anyhow::Result<String> {
     match creds {
         Credential::AuthorizedUser(ref secret) => {
@@ -259,10 +307,13 @@ async fn get_token_inner(
             }
 
             // No proxy - use yup-oauth2 (faster, has token caching)
-            let auth = yup_oauth2::AuthorizedUserAuthenticator::builder(secret.clone())
-                .with_storage(Box::new(crate::token_storage::EncryptedTokenStorage::new(
-                    token_cache_path.to_path_buf(),
-                )))
+            let mut builder = yup_oauth2::AuthorizedUserAuthenticator::builder(secret.clone());
+            if let Some(path) = token_cache_path {
+                builder = builder.with_storage(Box::new(
+                    crate::token_storage::EncryptedTokenStorage::new(path.to_path_buf()),
+                ));
+            }
+            let auth = builder
                 .build()
                 .await
                 .context("Failed to build authorized user authenticator")?;
@@ -274,14 +325,17 @@ async fn get_token_inner(
                 .to_string())
         }
         Credential::ServiceAccount(key) => {
-            let tc_filename = token_cache_path
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_else(|| "token_cache.json".to_string());
-            let sa_cache = token_cache_path.with_file_name(format!("sa_{tc_filename}"));
-            let builder = yup_oauth2::ServiceAccountAuthenticator::builder(key).with_storage(
-                Box::new(crate::token_storage::EncryptedTokenStorage::new(sa_cache)),
-            );
+            let mut builder = yup_oauth2::ServiceAccountAuthenticator::builder(key);
+            if let Some(path) = token_cache_path {
+                let tc_filename = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "token_cache.json".to_string());
+                let sa_cache = path.with_file_name(format!("sa_{tc_filename}"));
+                builder = builder.with_storage(Box::new(
+                    crate::token_storage::EncryptedTokenStorage::new(sa_cache),
+                ));
+            }
 
             let auth = builder
                 .build()
@@ -734,6 +788,83 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "my-test-token");
+    }
+
+    #[test]
+    fn test_credential_from_env_vars_none_without_refresh_token() {
+        let none =
+            credential_from_env_vars(None, Some("id".into()), Some("secret".into())).unwrap();
+        assert!(none.is_none());
+        let empty = credential_from_env_vars(
+            Some(String::new()),
+            Some("id".into()),
+            Some("secret".into()),
+        )
+        .unwrap();
+        assert!(empty.is_none());
+    }
+
+    #[test]
+    fn test_credential_from_env_vars_builds_authorized_user() {
+        let creds = credential_from_env_vars(
+            Some("env_refresh".into()),
+            Some("env_id".into()),
+            Some("env_secret".into()),
+        )
+        .unwrap()
+        .expect("credential should be built");
+        match creds {
+            Credential::AuthorizedUser(secret) => {
+                assert_eq!(secret.client_id, "env_id");
+                assert_eq!(secret.client_secret, "env_secret");
+                assert_eq!(secret.refresh_token, "env_refresh");
+            }
+            _ => panic!("Expected AuthorizedUser"),
+        }
+    }
+
+    #[test]
+    fn test_credential_from_env_vars_requires_client_id_and_secret() {
+        for (id, secret) in [
+            (None, Some("secret".to_string())),
+            (Some("id".to_string()), None),
+            (Some(String::new()), Some("secret".to_string())),
+        ] {
+            let err = credential_from_env_vars(Some("refresh".into()), id, secret).unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("GOOGLE_WORKSPACE_CLI_CLIENT_ID and GOOGLE_WORKSPACE_CLI_CLIENT_SECRET"));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_get_token_access_token_env_wins_over_refresh_token_env() {
+        let _token_guard = EnvVarGuard::set("GOOGLE_WORKSPACE_CLI_TOKEN", "my-test-token");
+        let _refresh_guard = EnvVarGuard::set("GOOGLE_WORKSPACE_CLI_REFRESH_TOKEN", "env_refresh");
+        let _id_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_CLI_CLIENT_ID");
+        let _secret_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_CLI_CLIENT_SECRET");
+
+        let result = get_token(&["https://www.googleapis.com/auth/drive"]).await;
+
+        assert_eq!(result.unwrap(), "my-test-token");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_get_token_refresh_token_env_without_client_errors() {
+        let _token_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_CLI_TOKEN");
+        let _refresh_guard = EnvVarGuard::set("GOOGLE_WORKSPACE_CLI_REFRESH_TOKEN", "env_refresh");
+        let _id_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_CLI_CLIENT_ID");
+        let _secret_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_CLI_CLIENT_SECRET");
+
+        let err = get_token(&["https://www.googleapis.com/auth/drive"])
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("GOOGLE_WORKSPACE_CLI_REFRESH_TOKEN is set"));
     }
 
     #[tokio::test]
