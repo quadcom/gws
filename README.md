@@ -115,6 +115,7 @@ The CLI supports multiple auth workflows so it works on your laptop, in CI, and 
 | `gcloud` installed and authenticated | [`gws auth setup`](#interactive-local-desktop) (fastest) |
 | A GCP project but no `gcloud` | [Manual OAuth setup](#manual-oauth-setup-google-cloud-console) |
 | An existing OAuth access token | [`GOOGLE_WORKSPACE_CLI_TOKEN`](#pre-obtained-access-token) |
+| A refresh token, injected as env vars | [`GOOGLE_WORKSPACE_CLI_REFRESH_TOKEN`](#refresh-token-from-environment-variables) |
 | Existing Credentials | [`GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE`](#service-account-server-to-server) |
 
 ### Interactive (local desktop)
@@ -204,14 +205,28 @@ Useful when another tool (e.g. `gcloud`) already mints tokens for your environme
 export GOOGLE_WORKSPACE_CLI_TOKEN=$(gcloud auth print-access-token)
 ```
 
+### Refresh Token from Environment Variables
+
+Useful in CI, containers and sandboxed agents that inject secrets as environment variables, where a plaintext credentials file on disk is unwanted. Nothing is read from or written to disk; access tokens are cached in memory for the life of the process.
+
+```bash
+export GOOGLE_WORKSPACE_CLI_CLIENT_ID=...
+export GOOGLE_WORKSPACE_CLI_CLIENT_SECRET=...
+export GOOGLE_WORKSPACE_CLI_REFRESH_TOKEN=...
+gws drive files list
+```
+
+All three must be set; a refresh token without both client values is an error.
+
 ### Precedence
 
 | Priority | Source                 | Set via                                 |
 | -------- | ---------------------- | --------------------------------------- |
 | 1        | Access token           | `GOOGLE_WORKSPACE_CLI_TOKEN`            |
-| 2        | Credentials file       | `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` |
-| 3        | Encrypted credentials  | `gws auth login`                        |
-| 4        | Plaintext credentials  | `~/.config/gws/credentials.json`        |
+| 2        | Refresh token env vars | `GOOGLE_WORKSPACE_CLI_REFRESH_TOKEN` (with `_CLIENT_ID`, `_CLIENT_SECRET`) |
+| 3        | Credentials file       | `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` |
+| 4        | Encrypted credentials  | `gws auth login`                        |
+| 5        | Plaintext credentials  | `~/.config/gws/credentials.json`        |
 
 Environment variables can also live in a `.env` file.
 
@@ -381,6 +396,7 @@ All variables are optional. See [`.env.example`](.env.example) for a copy-paste 
 | `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` | Path to OAuth credentials JSON (user or service account) |
 | `GOOGLE_WORKSPACE_CLI_CLIENT_ID` | OAuth client ID (alternative to `client_secret.json`) |
 | `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET` | OAuth client secret (paired with `CLIENT_ID`) |
+| `GOOGLE_WORKSPACE_CLI_REFRESH_TOKEN` | OAuth refresh token; with `CLIENT_ID` and `CLIENT_SECRET`, authenticates without a credentials file |
 | `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` | Override config directory (default: `~/.config/gws`) |
 | `GOOGLE_WORKSPACE_CLI_SANITIZE_TEMPLATE` | Default Model Armor template |
 | `GOOGLE_WORKSPACE_CLI_SANITIZE_MODE` | `warn` (default) or `block` |
